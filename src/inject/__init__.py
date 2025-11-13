@@ -258,7 +258,7 @@ class Injector:
 
         # Try to create a runtime binding.
         with _BINDING_LOCK:
-            binding = self._bindings.get(cls)
+            binding = self._bindings.get(cls, self._bindings.get(cls.__name__) if inspect.isclass(cls) else None)
             if binding:
                 return binding()
 

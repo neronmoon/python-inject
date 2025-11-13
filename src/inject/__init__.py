@@ -252,7 +252,7 @@ class Injector:
             ConstructorTypeError: over TypeError
 
         """
-        binding = self._bindings.get(cls)
+        binding = self._bindings.get(cls, self._bindings.get(cls.__name__) if inspect.isclass(cls) else None)
         if binding:
             return binding()
 

@@ -76,6 +76,7 @@ all other classes are runtime bindings::
 
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import functools
 import inspect
@@ -108,6 +109,14 @@ logger = logging.getLogger("inject")
 _INJECTOR = None  # Shared injector instance.
 _INJECTOR_LOCK = threading.RLock()  # Guards injector initialization.
 _BINDING_LOCK = threading.RLock()  # Guards runtime bindings.
+_BINDING_ASYNC_LOCK: asyncio.Lock | None = None  # Async guard for runtime bindings.
+
+
+def _get_async_binding_lock() -> asyncio.Lock:
+    global _BINDING_ASYNC_LOCK
+    if _BINDING_ASYNC_LOCK is None:
+        _BINDING_ASYNC_LOCK = asyncio.Lock()
+    return _BINDING_ASYNC_LOCK
 
 Injectable = t.Union[object, t.Any]
 T = t.TypeVar("T", bound=Injectable)
@@ -284,6 +293,58 @@ class Injector:
             logger.debug(msg, cls, instance)
             return instance
 
+    async def get_instance_async(self, cls: Binding) -> Injectable:
+        """
+        Return an instance for a class (async version).
+
+        Raises:
+            InjectorException: on errors
+            ConstructorTypeError: over TypeError
+
+        """
+        binding = self._bindings.get(cls, self._bindings.get(cls.__name__) if inspect.isclass(cls) else None)
+        if binding:
+            if hasattr(binding, '__acall__'):
+                return await binding.__acall__()
+            if inspect.iscoroutinefunction(binding):
+                return await binding()
+            return binding()
+
+        # Try to create a runtime binding.
+        async with _get_async_binding_lock():
+            binding = self._bindings.get(cls, self._bindings.get(cls.__name__) if inspect.isclass(cls) else None)
+            if binding:
+                if hasattr(binding, '__acall__'):
+                    return await binding.__acall__()
+                if inspect.iscoroutinefunction(binding):
+                    return await binding()
+                return binding()
+
+            if not self._bind_in_runtime:
+                msg = f"No binding was found for key={cls}"
+                raise InjectorException(msg)
+
+            if not callable(cls):
+                msg = (
+                    "Cannot create a runtime binding, the key is not callable,"
+                    f" key={cls}",
+                )
+                raise InjectorException(msg)
+
+            try:
+                if inspect.iscoroutinefunction(cls):
+                    instance = await cls()
+                else:
+                    instance = cls()
+            except TypeError as previous_error:
+                raise ConstructorTypeError(cls, previous_error)  # noqa: B904
+
+            self._bindings[cls] = lambda: instance
+
+            msg = "Created a runtime binding for key=%s, instance=%s"
+            logger.debug(msg, cls, instance)
+            return instance
+
 
 class InjectorException(Exception):
     pass
@@ -305,6 +366,20 @@ class _ConstructorBinding(t.Generic[T]):
             if self._created and self._instance is not None:
                 return self._instance
             self._instance = self._constructor()
+            self._created = True
+        return self._instance
+
+    async def __acall__(self) -> T:
+        if self._created and self._instance is not None:
+            return self._instance
+
+        async with _get_async_binding_lock():
+            if self._created and self._instance is not None:
+                return self._instance
+            if inspect.iscoroutinefunction(constructor):
+                self._instance = await self._constructor()
+            else:
+                self._instance = self._constructor()
             self._created = True
         return self._instance
 
@@ -372,7 +447,7 @@ class _ParameterInjection(t.Generic[T]):
             @functools.wraps(func)
             async def async_injection_wrapper(*args: t.Any, **kwargs: t.Any) -> T:  # noqa: ANN401
                 if self._name not in kwargs:
-                    kwargs[self._name] = instance(self._cls or self._name)
+                    kwargs[self._name] = await instance_async(self._cls or self._name)
                 async_func = t.cast("t.Callable[..., t.Awaitable[T]]", func)
                 return await async_func(*args, **kwargs)
 
@@ -445,7 +520,7 @@ class _ParametersInjection(t.Generic[T]):
                 )
                 for param, cls in params_to_provide.items():
                     if param not in provided_params:
-                        kwargs[param] = instance(cls)
+                        kwargs[param] = await instance_async(cls)
                 async_func = t.cast("t.Callable[..., t.Awaitable[T]]", func)
                 try:
                     with contextlib.ExitStack() as sync_stack:
@@ -594,6 +669,19 @@ def instance(cls: t.Hashable) -> Injectable: ...
 def instance(cls: Binding) -> Injectable:
     """Inject an instance of a class."""
     return get_injector_or_die().get_instance(cls)
+
+
+@t.overload
+async def instance_async(cls: type[T]) -> T: ...
+
+
+@t.overload
+async def instance_async(cls: t.Hashable) -> Injectable: ...
+
+
+async def instance_async(cls: Binding) -> Injectable:
+    """Inject an instance of a class (async version)."""
+    return await get_injector_or_die().get_instance_async(cls)
 
 
 @t.overload
